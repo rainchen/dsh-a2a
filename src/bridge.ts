@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   createAssistantMessage,
@@ -336,10 +337,11 @@ async function resolveAgent(
         ctx.logger.warn('a2a: 解析 agent preset 失败，agent 将使用全局工具运行', error)
       }
     }
+    const cwd = config.workspace ?? process.cwd()
     const handle = await agents.create({
       sessionId: SessionId(`a2a-${contextId}-${randomUUID().slice(0, 8)}`),
       meta: {
-        cwd: config.workspace ?? process.cwd(),
+        cwd,
         ...(agentPreset ? { agentPreset } : {}),
       },
       ...(agentOptions ? { agentOptions } : {}),
@@ -348,6 +350,18 @@ async function resolveAgent(
     states.set(contextId, { auto: handle })
     if (config.persistSessions !== false && store) {
       store.set(contextId, handle.agent.id)
+    }
+    // cwd 只是工作目录；侧边栏分组要靠 attachSession 显式记账（只有 GUI 的
+    // 「在分组内新建/分叉」会调用它，插件走 agents.create 时无人调用）。
+    try {
+      const canonical = await realpath(cwd)
+      const registry = ctx.get('workspaceRegistry') as {
+        list(): Array<{ path: string; attachSession(id: SessionId): Promise<void> }>
+      } | undefined
+      await registry?.list().find(workspace => workspace.path === canonical)
+        ?.attachSession(handle.agent.id)
+    } catch (error) {
+      ctx.logger.warn(`a2a: 会话 ${handle.agent.id} 登记 Workspace 分组失败`, error)
     }
     ctx.logger.info(`a2a: 为 context ${contextId} 创建专属 DSH agent（session ${handle.agent.id}）`)
     return { ok: true, agent: handle.agent }
@@ -409,6 +423,84 @@ function buildSetup(ctx: Context, config: BridgeConfig): (agentCtx: unknown) => 
       ctx.logger.warn('a2a: 挂载 agent preset 失败，agent 将使用全局工具运行', error)
     }
   }
+}
+
+/**
+ * 把 cwd 落在配置 `workspace` 目录下、但尚未记账的历史会话补登记进该分组。
+ *
+ * 建会话时的登记只覆盖新会话；插件启用前遗留的 A2A 会话仍留在「未分组」。
+ * 宿主的 bootstrap 只在 Workspace 注册表首次初始化时按 cwd 归组一次、之后
+ * 不再重跑，所以这些会话不会自愈。此函数在建会话登记之外补一次：只登记
+ * 头 cwd 与配置目录一致的会话，已在记账中的跳过，失败只记日志。
+ * @param ctx - 插件上下文。
+ * @param cwd - 配置的工作目录（`config.workspace` 或进程 cwd）。
+ */
+export async function adoptOrphanSessions(ctx: Context, cwd: string): Promise<void> {
+  // 服务可能尚未 active（apply() 早于其它插件 init 完成），重试几轮再放弃。
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const registry = ctx.get('workspaceRegistry') as {
+      list(): Array<{ path: string; sessionIds: readonly SessionId[]; attachSession(id: SessionId): Promise<void> }>
+    } | undefined
+    // 必须用 ctx.get()：Cordis 对 `ctx.sessionPersistence` 这类属性访问有 inject
+    // 门控，未声明依赖会直接抛 "cannot get property ... without inject"。
+    // strict=false 让尚未 active 的实现也能取到。
+    const persistence = (ctx.get as (name: string, strict?: boolean) => unknown)('sessionPersistence', false) as {
+      list(): Promise<Array<{ header: { id: SessionId; cwd?: string } }>>
+    } | undefined
+    if (registry && persistence) {
+      try {
+        if (await adoptInto(ctx, registry, persistence, cwd)) return
+      } catch (error) {
+        ctx.logger.warn('a2a: 补登记历史会话失败，它们将留在未分组', error)
+        return
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 300))
+  }
+  ctx.logger.info('a2a: 补登记放弃（等不到 workspaceRegistry / sessionPersistence 就绪）')
+}
+
+/**
+ * 单次补登记尝试。
+ * @returns 是否已把需要处理的情况处理完（true 表示不必再重试）。
+ */
+async function adoptInto(
+  ctx: Context,
+  registry: { list(): Array<{ path: string; sessionIds: readonly SessionId[]; attachSession(id: SessionId): Promise<void> }> },
+  persistence: { list(): Promise<Array<{ header: { id: SessionId; cwd?: string } }>> },
+  cwd: string,
+): Promise<boolean> {
+  const canonical = await realpath(cwd)
+  const workspace = registry.list().find(candidate => candidate.path === canonical)
+  if (!workspace) {
+    ctx.logger.info(`a2a: 补登记跳过（没有 path 为 ${canonical} 的 Workspace）`)
+    return true
+  }
+  const accounted = new Set<SessionId>(workspace.sessionIds)
+  // 用持久化列举而非 ctx.sessions.list()：后者只有活跃会话，重启后尚未被
+  // 唤醒的历史会话不在其中，正是需要补登记的那批。
+  const snapshots = await persistence.list()
+  let adopted = 0
+  for (const snapshot of snapshots) {
+    const { id, cwd: orphanCwd } = snapshot.header
+    if (accounted.has(id) || orphanCwd === undefined) continue
+    let resolved: string
+    try {
+      resolved = await realpath(orphanCwd)
+    } catch {
+      continue
+    }
+    if (resolved !== canonical) continue
+    try {
+      await workspace.attachSession(id)
+      accounted.add(id)
+      adopted += 1
+    } catch (error) {
+      ctx.logger.warn(`a2a: 会话 ${id} 补登记失败`, error)
+    }
+  }
+  ctx.logger.info(`a2a: 补登记完成，扫描 ${snapshots.length} 个已落盘会话，新登记 ${adopted} 个`)
+  return true
 }
 
 /** whenIdle 与取消轮询赛跑（500ms 粒度感知 tasks/cancel）。 */
