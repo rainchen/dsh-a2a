@@ -40,7 +40,7 @@ import z from '@deepseek-ai/schemastery'
 import type { AgentSkill } from './protocol.ts'
 import { buildAgentCard } from './protocol.ts'
 import { A2aServer } from './server.ts'
-import { createRunner } from './bridge.ts'
+import { adoptOrphanSessions, createRunner } from './bridge.ts'
 import { registerA2aTools } from './tools.ts'
 import { ContextSessionStore } from './persistence.ts'
 
@@ -206,6 +206,16 @@ export function apply(ctx: Context, config: Config): void {
       })
     }
   })
+
+  // 补登记历史会话：插件启用前遗留、cwd 已落在配置目录下却仍在「未分组」的
+  // A2A 会话。只做一次，任何失败（含同步抛错）都不得阻断插件加载。
+  if (config.mode !== 'echo' && config.mode !== 'llm') {
+    void Promise.resolve()
+      .then(() => adoptOrphanSessions(ctx, config.workspace ?? process.cwd()))
+      .catch((error: unknown) => {
+        ctx.logger.warn('a2a: 补登记历史会话失败，它们将留在未分组', error)
+      })
+  }
 
   // 出站工具：让本 profile 的 agent 能呼叫远端 A2A agent。
   if (config.tools !== false) {

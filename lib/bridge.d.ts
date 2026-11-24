@@ -32,4 +32,15 @@ export interface BridgeConfig {
     persistSessions?: boolean;
 }
 export declare function createRunner(ctx: Context, config: BridgeConfig, store?: ContextSessionStore): A2aRunner;
+/**
+ * 把 cwd 落在配置 `workspace` 目录下、但尚未记账的历史会话补登记进该分组。
+ *
+ * 建会话时的登记只覆盖新会话；插件启用前遗留的 A2A 会话仍留在「未分组」。
+ * 宿主的 bootstrap 只在 Workspace 注册表首次初始化时按 cwd 归组一次、之后
+ * 不再重跑，所以这些会话不会自愈。此函数在建会话登记之外补一次：只登记
+ * 头 cwd 与配置目录一致的会话，已在记账中的跳过，失败只记日志。
+ * @param ctx - 插件上下文。
+ * @param cwd - 配置的工作目录（`config.workspace` 或进程 cwd）。
+ */
+export declare function adoptOrphanSessions(ctx: Context, cwd: string): Promise<void>;
 //# sourceMappingURL=bridge.d.ts.map
