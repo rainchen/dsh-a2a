@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   createAssistantMessage,
@@ -336,10 +337,11 @@ async function resolveAgent(
         ctx.logger.warn('a2a: 解析 agent preset 失败，agent 将使用全局工具运行', error)
       }
     }
+    const cwd = config.workspace ?? process.cwd()
     const handle = await agents.create({
       sessionId: SessionId(`a2a-${contextId}-${randomUUID().slice(0, 8)}`),
       meta: {
-        cwd: config.workspace ?? process.cwd(),
+        cwd,
         ...(agentPreset ? { agentPreset } : {}),
       },
       ...(agentOptions ? { agentOptions } : {}),
@@ -348,6 +350,18 @@ async function resolveAgent(
     states.set(contextId, { auto: handle })
     if (config.persistSessions !== false && store) {
       store.set(contextId, handle.agent.id)
+    }
+    // cwd 只是工作目录；侧边栏分组要靠 attachSession 显式记账（只有 GUI 的
+    // 「在分组内新建/分叉」会调用它，插件走 agents.create 时无人调用）。
+    try {
+      const canonical = await realpath(cwd)
+      const registry = ctx.get('workspaceRegistry') as {
+        list(): Array<{ path: string; attachSession(id: SessionId): Promise<void> }>
+      } | undefined
+      await registry?.list().find(workspace => workspace.path === canonical)
+        ?.attachSession(handle.agent.id)
+    } catch (error) {
+      ctx.logger.warn(`a2a: 会话 ${handle.agent.id} 登记 Workspace 分组失败`, error)
     }
     ctx.logger.info(`a2a: 为 context ${contextId} 创建专属 DSH agent（session ${handle.agent.id}）`)
     return { ok: true, agent: handle.agent }
